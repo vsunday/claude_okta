@@ -10,3 +10,11 @@ __pycache__/
 
 # Local analysis reports
 .reports/
+
+# Private keys
+*.pem
+*.key
+
+# Editor swap files
+*.swp
+*~
