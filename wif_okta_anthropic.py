@@ -6,10 +6,11 @@ import sys
 import time
 import uuid
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import jwt
 import requests
+from anthropic import Anthropic, WorkloadIdentityCredentials
 from dotenv import load_dotenv
 
 # Resolve relative to this file so the script works from any working directory.
@@ -82,80 +83,66 @@ def get_okta_token(issuer: str, client_assertion: str) -> dict[str, Any]:
     return body
 
 
-def exchange_anthropic_token(
-    okta_token: str,
-    federation_rule_id: str,
-    organization_id: str,
-    service_account_id: str,
-    workspace_id: str | None,
-) -> dict[str, Any]:
-    payload: dict[str, Any] = {
-        "grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer",
-        "assertion": okta_token,
-        "federation_rule_id": federation_rule_id,
-        "organization_id": organization_id,
-        "service_account_id": service_account_id,
-    }
+def make_identity_token_provider(
+    issuer: str,
+    client_id: str,
+    key_id: str,
+    private_key_path: str,
+) -> Callable[[], str]:
+    summary_printed = False
 
-    if workspace_id:
-        payload["workspace_id"] = workspace_id
+    # The SDK calls this on every exchange/refresh. Anthropic rejects a reused
+    # jti, so each call must build a fresh assertion and fetch a fresh token.
+    def provide() -> str:
+        nonlocal summary_printed
 
-    response = requests.post(
-        "https://api.anthropic.com/v1/oauth/token",
-        headers={
-            "Accept": "application/json",
-            "Content-Type": "application/json",
-        },
-        json=payload,
-        timeout=30,
-    )
-
-    if not response.ok:
-        raise RuntimeError(
-            f"Anthropic token exchange failed: "
-            f"{response.status_code} {response.text}"
+        okta_response = get_okta_token(
+            issuer=issuer,
+            client_assertion=build_client_assertion(
+                issuer=issuer,
+                client_id=client_id,
+                key_id=key_id,
+                private_key_path=private_key_path,
+            ),
         )
 
-    body = response.json()
+        okta_token = okta_response["access_token"]
+        # Signature is verified by Anthropic; decode only for local sanity checks.
+        okta_header = jwt.get_unverified_header(okta_token)
+        okta_claims = jwt.decode(okta_token, options={"verify_signature": False})
 
-    if not body.get("access_token"):
-        raise RuntimeError(f"Anthropic access_token missing: {body}")
+        # Anthropic's 401 is opaque, so fail locally with an actionable message.
+        if okta_claims.get("aud") != "https://api.anthropic.com":
+            raise RuntimeError(
+                f"Invalid Okta JWT audience: {okta_claims.get('aud')}"
+            )
 
-    return body
+        if okta_claims.get("sub") != client_id:
+            raise RuntimeError(
+                f"Invalid Okta JWT subject: {okta_claims.get('sub')}"
+            )
 
+        if not summary_printed:
+            summary_printed = True
+            print(
+                json.dumps(
+                    {
+                        "okta_token": {
+                            "kid": okta_header.get("kid"),
+                            "iss": okta_claims.get("iss"),
+                            "sub": okta_claims.get("sub"),
+                            "aud": okta_claims.get("aud"),
+                            "expires_in": okta_response.get("expires_in"),
+                        }
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                )
+            )
 
-def call_messages_api(
-    access_token: str,
-    model: str,
-    prompt: str,
-) -> dict[str, Any]:
-    response = requests.post(
-        "https://api.anthropic.com/v1/messages",
-        headers={
-            "Accept": "application/json",
-            "Authorization": f"Bearer {access_token}",
-            "anthropic-version": "2023-06-01",
-            "Content-Type": "application/json",
-        },
-        json={
-            "model": model,
-            "max_tokens": 256,
-            "messages": [
-                {
-                    "role": "user",
-                    "content": prompt,
-                }
-            ],
-        },
-        timeout=120,
-    )
+        return okta_token
 
-    if not response.ok:
-        raise RuntimeError(
-            f"Messages API request failed: {response.status_code} {response.text}"
-        )
-
-    return response.json()
+    return provide
 
 
 def main() -> int:
@@ -172,67 +159,18 @@ def main() -> int:
     service_account_id = env("ANTHROPIC_SERVICE_ACCOUNT_ID")
     workspace_id = os.getenv("ANTHROPIC_WORKSPACE_ID")
 
-    client_assertion = build_client_assertion(
-        issuer=issuer,
-        client_id=client_id,
-        key_id=key_id,
-        private_key_path=private_key_path,
-    )
-
-    okta_response = get_okta_token(
-        issuer=issuer,
-        client_assertion=client_assertion,
-    )
-
-    okta_token = okta_response["access_token"]
-    # Signature is verified by Anthropic; decode only for local sanity checks.
-    okta_header = jwt.get_unverified_header(okta_token)
-    okta_claims = jwt.decode(okta_token, options={"verify_signature": False})
-
-    if okta_claims.get("aud") != "https://api.anthropic.com":
-        raise RuntimeError(
-            f"Invalid Okta JWT audience: {okta_claims.get('aud')}"
-        )
-
-    if okta_claims.get("sub") != client_id:
-        raise RuntimeError(
-            f"Invalid Okta JWT subject: {okta_claims.get('sub')}"
-        )
-
-    print(
-        json.dumps(
-            {
-                "okta_token": {
-                    "kid": okta_header.get("kid"),
-                    "iss": okta_claims.get("iss"),
-                    "sub": okta_claims.get("sub"),
-                    "aud": okta_claims.get("aud"),
-                    "expires_in": okta_response.get("expires_in"),
-                }
-            },
-            ensure_ascii=False,
-            indent=2,
-        )
-    )
-
-    anthropic_response = exchange_anthropic_token(
-        okta_token=okta_token,
+    credentials = WorkloadIdentityCredentials(
+        identity_token_provider=make_identity_token_provider(
+            issuer=issuer,
+            client_id=client_id,
+            key_id=key_id,
+            private_key_path=private_key_path,
+        ),
         federation_rule_id=federation_rule_id,
         organization_id=organization_id,
         service_account_id=service_account_id,
         workspace_id=workspace_id,
     )
-
-    anthropic_token = anthropic_response["access_token"]
-
-    result: dict[str, Any] = {
-        "anthropic_token_exchange": {
-            "token_type": anthropic_response.get("token_type"),
-            "expires_in": anthropic_response.get("expires_in"),
-            "scope": anthropic_response.get("scope"),
-            "access_token": "obtained",
-        }
-    }
 
     if "--messages" in sys.argv:
         model = env("ANTHROPIC_MODEL")
@@ -241,11 +179,21 @@ def main() -> int:
             or "WIFの接続テストです。短く応答してください。"
         )
 
-        result["messages"] = call_messages_api(
-            access_token=anthropic_token,
+        # The SDK performs and refreshes the token exchange itself.
+        message = Anthropic(credentials=credentials).messages.create(
             model=model,
-            prompt=prompt,
+            max_tokens=256,
+            messages=[{"role": "user", "content": prompt}],
         )
+        result: dict[str, Any] = {"messages": message.to_dict()}
+    else:
+        access_token = credentials()
+        result = {
+            "anthropic_token_exchange": {
+                "expires_at": access_token.expires_at,
+                "access_token": "obtained",
+            }
+        }
 
     print(json.dumps(result, ensure_ascii=False, indent=2))
     return 0
