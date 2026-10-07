@@ -1,0 +1,5 @@
+anthropic==1.11.0
+# [crypto] pulls in cryptography, required by PyJWT for RS256 signing
+pyjwt[crypto]==2.15.1
+requests==2.34.2
+python-dotenv==1.2.4

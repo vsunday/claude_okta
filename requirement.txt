@@ -1,5 +1,0 @@
-anthropic
-pyjwt
-cryptography
-requests
-python-dotenv
